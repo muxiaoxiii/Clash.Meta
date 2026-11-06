@@ -15,6 +15,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/log"
@@ -35,8 +36,26 @@ type RealityConfig struct {
 	SupportX25519MLKEM768 bool
 }
 
+// realityHybridPref remembers, per server endpoint, whether the X25519MLKEM768
+// key share must stay in the ClientHello. New xray REALITY servers (xtls/reality
+// since 2026-10) reject hellos without it, while old ones mishandle it; the first
+// dial tries with the share and a definitive auth rejection flips later dials.
+var realityHybridPref sync.Map // remote addr string -> bool
+
 func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHelloID, serverName string, realityConfig *RealityConfig) (net.Conn, error) {
+	remote := serverName
+	if addr := conn.RemoteAddr(); addr != nil {
+		remote = addr.String()
+	}
 	for retry := 0; ; retry++ {
+		useHybrid := realityConfig.SupportX25519MLKEM768
+		if !useHybrid {
+			if pref, ok := realityHybridPref.Load(remote); ok {
+				useHybrid = pref.(bool)
+			} else {
+				useHybrid = true // first dial keeps the share new servers require
+			}
+		}
 		verifier := &realityVerifier{
 			serverName: serverName,
 		}
@@ -55,7 +74,7 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			return nil, err
 		}
 
-		if !realityConfig.SupportX25519MLKEM768 { // for X25519MLKEM768 does not work properly with the old reality server
+		if !useHybrid {
 			err = BuildRemovedX25519MLKEM768HandshakeState(uConn)
 			if err != nil {
 				return nil, err
@@ -71,9 +90,9 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		binary.BigEndian.PutUint64(hello.SessionId, uint64(ntp.Now().Unix()))
 
 		copy(hello.SessionId[8:], realityConfig.ShortID[:])
-		hello.SessionId[0] = 1
-		hello.SessionId[1] = 8
-		hello.SessionId[2] = 2
+		hello.SessionId[0] = 26 // client version 26.10.31: xray v26.7.11+ REALITY servers
+		hello.SessionId[1] = 10 // reject the hardcoded 1.8.2 below their default minClientVer 26.3.27
+		hello.SessionId[2] = 31
 
 		//log.Debugln("REALITY hello.sessionId[:16]: %v", hello.SessionId[:16])
 
@@ -123,8 +142,14 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		log.Debugln("REALITY Authentication: %v, AEAD: %T", verifier.verified, aeadCipher)
 
 		if !verifier.verified {
+			if useHybrid && !realityConfig.SupportX25519MLKEM768 {
+				realityHybridPref.Store(remote, false) // old server: strip the share on later dials
+			}
 			go realityClientFallback(uConn, uConfig.ServerName, fingerprint)
 			return nil, errors.New("REALITY authentication failed")
+		}
+		if useHybrid {
+			realityHybridPref.Store(remote, true)
 		}
 
 		return uConn, nil
